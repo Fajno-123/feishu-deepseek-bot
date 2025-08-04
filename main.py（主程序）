@@ -1,0 +1,110 @@
+from flask import Flask, request, jsonify
+import requests
+import json
+import os
+import hashlib
+import base64
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.backends import default_backend
+
+app = Flask(__name__)
+
+# 从环境变量获取配置
+DEEPSEEK_API_KEY = sk-f1e2862dfbd347fea1fb8cc9eab41996('DEEPSEEK_API_KEY')
+FEISHU_APP_ID = cli_a81a3d390322500b('FEISHU_APP_ID')
+FEISHU_APP_SECRET = HmdzhXM1CW0OTUR7MFyQfbDVr7vWMY1L('FEISHU_APP_SECRET')
+FEISHU_ENCRYPT_KEY = xNs7lfIMZhtFN9oqUqJARd1UAVfmzSwQ('FEISHU_ENCRYPT_KEY', '')
+
+def decrypt_feishu_data(encrypted_data: str) -> dict:
+    """解密飞书事件数据"""
+    if not FEISHU_ENCRYPT_KEY:
+        return json.loads(encrypted_data)
+    
+    key_b64 = base64.b64decode(FEISHU_ENCRYPT_KEY + "==")
+    data_b64 = base64.b64decode(encrypted_data)
+    
+    backend = default_backend()
+    cipher = Cipher(algorithms.AES(key_b64), modes.CBC(bytes(16)), backend=backend)
+    decryptor = cipher.decryptor()
+    decrypted = decryptor.update(data_b64) + decryptor.finalize()
+    
+    # 移除PKCS#7填充
+    pad = decrypted[-1]
+    return json.loads(decrypted[:-pad].decode('utf-8'))
+
+def get_feishu_token():
+    """获取飞书访问令牌"""
+    url = "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal"
+    res = requests.post(url, json={
+        "app_id": FEISHU_APP_ID,
+        "app_secret": FEISHU_APP_SECRET
+    })
+    return res.json().get('tenant_access_token', '')
+
+def call_deepseek(prompt: str) -> str:
+    """调用DeepSeek API"""
+    headers = {"Authorization": f"Bearer {DEEPSEEK_API_KEY}"}
+    payload = {
+        "model": "deepseek-chat",
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.7,
+        "max_tokens": 2000
+    }
+    
+    try:
+        response = requests.post(
+            "https://api.deepseek.com/v1/chat/completions",
+            headers=headers,
+            json=payload,
+            timeout=10
+        )
+        return response.json()['choices'][0]['message']['content']
+    except Exception as e:
+        return f"⚠️ DeepSeek处理失败: {str(e)}"
+
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    # 处理飞书URL验证
+    data = request.json
+    if data.get('type') == 'url_verification':
+        return jsonify({"challenge": data.get('challenge')})
+    
+    # 解密事件数据
+    encrypted_data = data.get('encrypt', '')
+    if encrypted_data:
+        event_data = decrypt_feishu_data(encrypted_data)
+    else:
+        event_data = data
+    
+    # 处理消息事件
+    if event_data.get('event', {}).get('type') == 'im.message.receive_v1':
+        message = event_data['event']['message']
+        content = json.loads(message['content'])
+        user_text = content.get('text', '').strip()
+        
+        # 忽略空消息和机器人自身消息
+        if not user_text or message['message_type'] != 'text':
+            return jsonify({"code": 0})
+        
+        # 调用DeepSeek
+        ai_response = call_deepseek(user_text)
+        
+        # 回复用户
+        access_token = get_feishu_token()
+        if not access_token:
+            return jsonify({"code": 1, "msg": "获取飞书token失败"})
+        
+        reply_url = "https://open.feishu.cn/open-apis/im/v1/messages"
+        headers = {"Authorization": f"Bearer {access_token}"}
+        reply_payload = {
+            "receive_id": event_data['event']['sender']['sender_id']['user_id'],
+            "msg_type": "text",
+            "content": json.dumps({"text": ai_response})
+        }
+        
+        requests.post(reply_url, headers=headers, json=reply_payload)
+    
+    return jsonify({"code": 0})
+
+if __name__ == '__main__':
+    app.run()
